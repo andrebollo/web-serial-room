@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<title>Terminal Serial Multiusuário</title>
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  body { font-family: monospace; background:#111; color:#0f0; padding:10px; }
+  textarea { width:100%; height:320px; background:#000; color:#0f0; padding:8px; box-sizing:border-box; }
+  #typingLog, #serialLog, #users { height:120px; overflow:auto; margin-top:8px; padding:6px; background:#222; color:#fff; }
+  #serialLog { background:#111; color:#0ff; }
+  .host { color:#ff0; font-weight:bold; }
+  label { color:#ddd; margin-right:6px; }
+  input, select, button { margin:4px; padding:5px; }
+</style>
+</head>
+<body>
+<h2>Terminal Serial Multiusuário</h2>
+
+<div>
+  <label>Nome:</label>
+  <input id="username" />
+  <label>Sala:</label>
+  <input id="room" />
+  <button id="joinBtn">Entrar</button>
+</div>
+
+<div>
+  <label>Baud:</label>
+  <select id="baudrate">
+    <option>9600</option><option>19200</option><option>38400</option><option>57600</option><option selected>115200</option>
+  </select>
+  <button id="serialBtn">Conectar Serial</button>
+</div>
+
+<div>
+  <label><input type="checkbox" id="localEcho"> Eco Local</label>
+</div>
+
+<textarea id="terminal" readonly></textarea>
+
+<div id="typingLog"></div>
+<div id="serialLog"></div>
+<div id="users"></div>
+
+<script>
+const socket = io();
+let currentRoom = null;
+let username = null;
+let isHost = false;
+let port, reader, writer;
+
+const term = document.getElementById("terminal");
+const typingLog = document.getElementById("typingLog");
+const serialLog = document.getElementById("serialLog");
+const usersBox = document.getElementById("users");
+
+function keyToBytes(e){
+  if(e.ctrlKey){
+    if(e.key === "c" || e.key === "C") return "\x03";
+    if(e.key === "z" || e.key === "Z") return "\x1a";
+  }
+  switch(e.key){
+    case "Backspace": return "\x08";
+    case "Delete": return "\x7F";
+    case "ArrowUp": return "\x1b[A";
+    case "ArrowDown": return "\x1b[B";
+    case "ArrowRight": return "\x1b[C";
+    case "ArrowLeft": return "\x1b[D";
+    case "Enter": return "\r";
+    case "Tab": return "\t";
+    default: return e.key.length === 1 ? e.key : null;
+  }
+}
+
+document.getElementById("joinBtn").onclick = () => {
+  username = document.getElementById("username").value.trim();
+  currentRoom = document.getElementById("room").value.trim();
+  if(!username || !currentRoom) { alert("Preencha nome e sala"); return; }
+  socket.emit("joinRoom", { room: currentRoom, name: username });
+  document.getElementById("joinBtn").innerText = "Mudar de sala";
+};
+
+socket.on("appendText", (data) => {
+  term.value += data;
+  term.scrollTop = term.scrollHeight;
+});
+
+socket.on("syncText", (text) => {
+  term.value = text;
+  term.scrollTop = term.scrollHeight;
+});
+
+socket.on("typingLog", (msg) => {
+  typingLog.innerHTML += msg + "<br>";
+  typingLog.scrollTop = typingLog.scrollHeight;
+});
+
+socket.on("serialLog", (msg) => {
+  serialLog.innerHTML += msg + "<br>";
+  serialLog.scrollTop = serialLog.scrollHeight;
+});
+
+socket.on("updateUsers", ({ users, host, serialHost }) => {
+  let html = "<b>Usuários:</b><br>";
+  for(const id in users){
+    html += users[id];
+    if(id === host) html += " <span class='host'>(Host)</span>";
+    if(users[id] === serialHost) html += " <span class='host'>(Serial)</span>";
+    html += "<br>";
+  }
+  usersBox.innerHTML = html;
+});
+
+socket.on("serialStatus", (msg) => {
+  const btn = document.getElementById("serialBtn");
+  btn.innerText = msg;
+  btn.disabled = true;
+});
+
+// --- Digitação local com Eco opcional
+term.addEventListener("keydown", (e) => {
+  const data = keyToBytes(e);
+  if (!data) return;
+  e.preventDefault();
+  if (!currentRoom || !username) { alert("Entre em uma sala primeiro."); return; }
+
+  socket.emit("keyPress", { room: currentRoom, data: data });
+
+  if (document.getElementById("localEcho").checked) {
+    if (data === "\x08" || data === "\x7F") {
+      term.value = term.value.slice(0, -1);
+    } else if (data >= " " || data === "\t" || data === "\r") {
+      term.value += data;
+    }
+    term.scrollTop = term.scrollHeight;
+  }
+});
+
+// --- Serial: conectar (apenas no host)
+document.getElementById("serialBtn").onclick = async () => {
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: parseInt(document.getElementById("baudrate").value, 10) });
+
+    isHost = true;
+    socket.emit("setHost", { room: currentRoom });
+    socket.emit("serialConnected", { room: currentRoom, name: username });
+
+    document.getElementById("serialBtn").innerText = `Conectado por ${username}`;
+    document.getElementById("serialBtn").disabled = true;
+
+    const textDecoder = new TextDecoderStream();
+    port.readable.pipeTo(textDecoder.writable);
+    reader = textDecoder.readable.getReader();
+
+    const textEncoder = new TextEncoderStream();
+    textEncoder.readable.pipeTo(port.writable);
+    writer = textEncoder.writable.getWriter();
+
+    readLoop();
+  } catch (err) {
+    alert("Erro ao abrir serial: " + err);
+  }
+};
+
+// Host: escreve na porta serial
+socket.on("hostWrite", async ({ data }) => {
+  if (!isHost) return;
+  try {
+    await writer.write(data);
+  } catch (err) {
+    serialLog.innerHTML += `Erro escrevendo porta: ${err}<br>`;
+  }
+});
+
+// Host: leitura da serial ? envia para servidor
+async function readLoop(){
+  while(true){
+    try {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      socket.emit("serialIn", { room: currentRoom, data: value });
+    } catch (err) {
+      serialLog.innerHTML += `Erro na leitura serial: ${err}<br>`;
+      break;
+    }
+  }
+}
+</script>
+</body>
+</html>
